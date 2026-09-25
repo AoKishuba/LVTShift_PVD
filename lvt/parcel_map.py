@@ -262,8 +262,11 @@ def create_parcel_map(
     Notes
     -----
     The HTML embeds all parcel geometry and data inline (no server needed).
-    The Leaflet library and OpenStreetMap base tiles load from their public
-    CDNs, so the file needs internet access to render the base map. For very
+    The Leaflet library and the Esri base tiles (World Street Map for road,
+    World Imagery for satellite) load from their public CDNs, so the file needs
+    internet access to render the base map. OpenStreetMap's own tile servers are
+    deliberately not used: they reject requests without a Referer header, which
+    a ``file://`` page or a sandboxed preview never sends. For very
     large cities pass ``simplify_tolerance_m`` to ``save_parcel_map_export``
     first to keep the embedded GeoJSON small.
     """
@@ -563,7 +566,7 @@ _HTML_TEMPLATE = """<!doctype html>
       <div class="hint"><b>Click any parcel</b> to see its parcel number, owner, address, and how its tax bill changes under the reform. Use the layer control to switch between road and satellite.</div>
     </aside>
   </div>
-  <p class="ft"><b>How to read it.</b> Parcels with little building value relative to land (vacant lots, parking) tend to pay more; building-heavy parcels (apartments, offices) tend to pay less. Green = pays less, red = pays more, grey = no current tax to compare. Base maps: OpenStreetMap (road) and Esri World Imagery (satellite).</p>
+  <p class="ft"><b>How to read it.</b> Parcels with little building value relative to land (vacant lots, parking) tend to pay more; building-heavy parcels (apartments, offices) tend to pay less. Green = pays less, red = pays more, grey = no current tax to compare. Base maps: Esri World Street Map (road) and Esri World Imagery (satellite).</p>
   __GALLERY__
 </div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -572,8 +575,12 @@ const DATA = __GEOJSON__;
 const CENTER = __CENTER__;
 
 const map = L.map('map', { preferCanvas: true }).setView(CENTER, 13);
-const roadLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-  maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'
+// Esri street tiles, not tile.openstreetmap.org: OSM's servers reject requests without a Referer,
+// which a file:// page or a sandboxed preview never sends (403 "not following the tile usage policy").
+const roadLayer = L.tileLayer(
+  'https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}', {
+  maxZoom: 19,
+  attribution: 'Tiles &copy; Esri &mdash; Source: Esri, HERE, Garmin, USGS, &copy; OpenStreetMap contributors, and the GIS User Community'
 });
 const satelliteLayer = L.tileLayer(
   'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
@@ -891,7 +898,7 @@ _PMTILES_HTML_TEMPLATE = """<!doctype html>
       <div class="hint"><b>Click any parcel</b> to see its parcel number, owner, address, land/building values, and how its tax bill changes under the reform.</div>
     </aside>
   </div>
-  <p class="ft"><b>How to read it.</b> Parcels with little building value relative to land (vacant lots, parking) tend to pay more; building-heavy parcels (apartments, offices) tend to pay less. Green = pays less, red = pays more, grey = no current tax. Base maps: OpenStreetMap (road) and Esri World Imagery (satellite).</p>
+  <p class="ft"><b>How to read it.</b> Parcels with little building value relative to land (vacant lots, parking) tend to pay more; building-heavy parcels (apartments, offices) tend to pay less. Green = pays less, red = pays more, grey = no current tax. Base maps: Esri World Street Map (road) and Esri World Imagery (satellite).</p>
   __GALLERY__
 </div>
 <script src="https://unpkg.com/pmtiles@3.2.0/dist/pmtiles.js"></script>
@@ -910,14 +917,16 @@ const map = new maplibregl.Map({
   style: {
     version: 8,
     sources: {
-      osm: { type: 'raster', tileSize: 256, attribution: '&copy; OpenStreetMap contributors',
-        tiles: ['https://a.tile.openstreetmap.org/{z}/{x}/{y}.png', 'https://b.tile.openstreetmap.org/{z}/{x}/{y}.png', 'https://c.tile.openstreetmap.org/{z}/{x}/{y}.png'] },
+      // Esri street tiles, not tile.openstreetmap.org, which rejects requests without a Referer header
+      road: { type: 'raster', tileSize: 256,
+        attribution: 'Tiles &copy; Esri &mdash; Source: Esri, HERE, Garmin, USGS, &copy; OpenStreetMap contributors',
+        tiles: ['https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}'] },
       esri: { type: 'raster', tileSize: 256, attribution: 'Tiles &copy; Esri, Maxar, Earthstar Geographics',
         tiles: ['https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'] },
       parcels: { type: 'vector', url: 'pmtiles://./__PMTILES__' }
     },
     layers: [
-      { id: 'osm', type: 'raster', source: 'osm' },
+      { id: 'road', type: 'raster', source: 'road' },
       { id: 'esri', type: 'raster', source: 'esri', layout: { visibility: 'none' } },
       { id: 'parcels-fill', type: 'fill', source: 'parcels', 'source-layer': 'parcels',
         paint: { 'fill-color': COLOR, 'fill-opacity': 0.75 } },
@@ -931,8 +940,8 @@ map.addControl(new maplibregl.FullscreenControl(), 'top-left');
 
 // base-map toggle
 const bRoad = document.getElementById('t-road'), bSat = document.getElementById('t-sat');
-bRoad.onclick = () => { map.setLayoutProperty('osm', 'visibility', 'visible'); map.setLayoutProperty('esri', 'visibility', 'none'); bRoad.classList.add('active'); bSat.classList.remove('active'); };
-bSat.onclick = () => { map.setLayoutProperty('osm', 'visibility', 'none'); map.setLayoutProperty('esri', 'visibility', 'visible'); bSat.classList.add('active'); bRoad.classList.remove('active'); };
+bRoad.onclick = () => { map.setLayoutProperty('road', 'visibility', 'visible'); map.setLayoutProperty('esri', 'visibility', 'none'); bRoad.classList.add('active'); bSat.classList.remove('active'); };
+bSat.onclick = () => { map.setLayoutProperty('road', 'visibility', 'none'); map.setLayoutProperty('esri', 'visibility', 'visible'); bSat.classList.add('active'); bRoad.classList.remove('active'); };
 
 const insp = document.getElementById('insp');
 const money = v => (v == null || v === '' || isNaN(Number(v))) ? '\\u2014' : '$' + Math.round(Number(v)).toLocaleString();
