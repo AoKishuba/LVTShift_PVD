@@ -23,6 +23,7 @@ import glob
 import html
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -37,6 +38,11 @@ from lvt.lvt_utils import build_standard_export_frame
 
 WGS84 = 'EPSG:4326'
 WEB_MERCATOR = 'EPSG:3857'
+
+# Optional per-parcel columns a model can set on its GeoDataFrame to drive the map's
+# land:building ratio slider when its split is not solved on taxable land/improvement
+# in one group (see _ratio_slider_spec).
+RATIO_SLIDER_COLS = ['ratio_basis_land', 'ratio_basis_improvement', 'ratio_group']
 
 
 def _build_parcel_urls(
@@ -122,6 +128,14 @@ def save_parcel_map_export(
     -------
     gpd.GeoDataFrame
         The written frame, in WGS84.
+
+    Notes
+    -----
+    Any of ``RATIO_SLIDER_COLS`` present on ``gdf`` (``ratio_basis_land``,
+    ``ratio_basis_improvement``, ``ratio_group``) are carried into the export
+    so ``create_parcel_map`` can offer a land:building ratio slider for models
+    solved per group or on adjusted values. Plain single-group split-rate
+    models need none of them.
     """
     if not isinstance(gdf, gpd.GeoDataFrame):
         raise TypeError('save_parcel_map_export requires a GeoDataFrame')
@@ -157,6 +171,11 @@ def save_parcel_map_export(
             out[out_col] = gdf[src_col].astype('string')
         else:
             out[out_col] = pd.Series(pd.NA, index=out.index, dtype='string')
+
+    # Optional ratio-slider inputs (see _ratio_slider_spec), carried through when the model supplies them.
+    for col in RATIO_SLIDER_COLS:
+        if col in gdf.columns:
+            out[col] = gdf[col]
 
     # Attach geometry (aligned by index) and normalize to WGS84.
     geom = gpd.GeoSeries(gdf[geometry_col].values, index=gdf.index, crs=gdf.crs)
@@ -292,8 +311,12 @@ def create_parcel_map(
             simplify_tolerance_m, preserve_topology=True)
         gdf = gdf.set_geometry(gpd.GeoSeries(merc, crs=WEB_MERCATOR)).to_crs(WGS84)
 
+    slider = _ratio_slider_spec(gdf, city)
+    if slider is not None:
+        basis_land, basis_bldg, group_codes = slider.pop('arrays')
+
     features = []
-    for row in gdf.itertuples(index=False):
+    for i, row in enumerate(gdf.itertuples(index=False)):
         geom = getattr(row, 'geometry')
         if geom is None or geom.is_empty:
             continue
@@ -313,6 +336,8 @@ def create_parcel_map(
             'pct': None if pct is None else round(pct, 1),
             'c': _color_for(pct),
         }
+        if slider is not None:
+            props.update({'bl': _num(basis_land[i]), 'bi': _num(basis_bldg[i]), 'g': int(group_codes[i])})
         features.append({
             'type': 'Feature',
             'properties': props,
@@ -335,6 +360,9 @@ def create_parcel_map(
         f"a revenue-neutral {model_label}. Green = pays less, red = pays more. "
         f"Toggle the road / satellite base map, and click a parcel to inspect it."
     )
+    if slider is not None:
+        subtitle += (" Drag the land : building ratio slider on the map to re-solve the "
+                     "revenue-neutral split at any ratio.")
     out_city_dir = os.path.join(output_dir, city)
     os.makedirs(out_city_dir, exist_ok=True)
     out_path = os.path.join(out_city_dir, 'parcel_map.html')
@@ -347,14 +375,118 @@ def create_parcel_map(
         _HTML_TEMPLATE
         .replace('__TITLE__', html.escape(heading))
         .replace('__SUBTITLE__', html.escape(subtitle))
+        .replace('__RATIO__', json.dumps(slider))
+        .replace('__COLOR_STOPS__', json.dumps(
+            [[t if np.isfinite(t) else 1e12, c] for t, c in _COLOR_STOPS]))
+        .replace('__NO_DATA_COLOR__', json.dumps(_NO_DATA_COLOR))
+        .replace('__GALLERY__', gallery)
         .replace('__GEOJSON__', json.dumps(fc, separators=(',', ':')))
         .replace('__CENTER__', json.dumps(center))
-        .replace('__GALLERY__', gallery)
     )
     with open(out_path, 'w', encoding='utf-8') as fh:
         fh.write(html_doc)
-    print(f"  ✓ {city}: interactive map → {out_path}  [{len(features):,} parcels]")
+    slider_note = ''
+    if slider is not None:
+        slider_note = (f"; ratio slider at {slider['ratio']:g}:1 over {len(slider['groups'])} group(s)"
+                       f"{', 1:1 = current bills' if slider['today'] else ''}")
+    print(f"  ✓ {city}: interactive map → {out_path}  [{len(features):,} parcels{slider_note}]")
     return out_path
+
+
+def _parse_split_ratio(model_type: str) -> Optional[float]:
+    """Land:improvement ratio of a pure split-rate ``model_type`` slug, else None.
+
+    Accepts ``'split_rate:4.0'`` and ``'split_rate_4to1'``. Combined models
+    (e.g. ``'split_rate:4.0,exemption:50000'``) and abatements return None.
+    """
+    m = re.fullmatch(r'split_rate[:_](\d+(?:\.\d+)?)(?:to(\d+(?:\.\d+)?))?', (model_type or '').strip().lower())
+    if not m:
+        return None
+    ratio = float(m.group(1)) / float(m.group(2) or 1)
+    return ratio if ratio >= 1 else None
+
+
+def _ratio_slider_spec(gdf: gpd.GeoDataFrame, city: str) -> Optional[dict]:
+    """Inputs for the map's in-browser land:building ratio slider, or None.
+
+    A revenue-neutral split-rate solved within group g is linear in its basis
+    values: ``new_i(R) = T_g * (R * land_i + bldg_i) / (R * LAND_g + BLDG_g)``,
+    where ``T_g`` is the group's current revenue. That lets the browser re-solve
+    every parcel for any ratio R. The basis defaults to taxable land/improvement
+    in a single group (a plain ``model_split_rate_tax`` model). A model solved per
+    class or on adjusted values sets ``ratio_basis_land`` /
+    ``ratio_basis_improvement`` / ``ratio_group`` instead; a categorical
+    ``ratio_group`` keeps its category order in the rates table.
+
+    The slider is only enabled when this closed form reproduces ``new_tax`` at the
+    modeled ratio, so models with caps, credits, or held-out parcels (which are not
+    linear in the basis) keep a fixed-ratio map.
+
+    Parameters
+    ----------
+    gdf : gpd.GeoDataFrame
+        The map export frame (``save_parcel_map_export`` output).
+    city : str
+        City slug, used in the message printed when the slider is off.
+
+    Returns
+    -------
+    dict or None
+        ``ratio`` (modeled ratio), ``today`` (True when 1:1 reproduces current
+        bills), ``groups`` (label and current-revenue / land / building totals per
+        group), and ``arrays`` (per-row basis land, basis building, group code).
+    """
+    model_type = str(gdf['model_type'].iloc[0]) if 'model_type' in gdf.columns and len(gdf) else ''
+    ratio = _parse_split_ratio(model_type)
+    if ratio is None or not {'current_tax', 'new_tax'} <= set(gdf.columns):
+        return None
+
+    if {'ratio_basis_land', 'ratio_basis_improvement'} <= set(gdf.columns):
+        land = pd.to_numeric(gdf['ratio_basis_land'], errors='coerce').fillna(0.0).to_numpy()
+        bldg = pd.to_numeric(gdf['ratio_basis_improvement'], errors='coerce').fillna(0.0).to_numpy()
+    else:
+        land = pd.to_numeric(gdf['taxable_land_value'], errors='coerce').fillna(0.0).to_numpy()
+        bldg = pd.to_numeric(gdf['taxable_improvement_value'], errors='coerce').fillna(0.0).to_numpy()
+    current = pd.to_numeric(gdf['current_tax'], errors='coerce').fillna(0.0).to_numpy()
+    new = pd.to_numeric(gdf['new_tax'], errors='coerce').fillna(0.0).to_numpy()
+
+    if 'ratio_group' in gdf.columns:
+        groups = gdf['ratio_group']
+        if isinstance(groups.dtype, pd.CategoricalDtype):
+            groups = groups.cat.remove_unused_categories()
+            codes, labels = groups.cat.codes.to_numpy(), [str(c) for c in groups.cat.categories]
+        else:
+            codes, uniques = pd.factorize(groups.astype(str), sort=True)
+            labels = [str(u) for u in uniques]
+    else:
+        codes, labels = np.zeros(len(gdf), dtype=int), ['All modeled parcels']
+    if (codes < 0).any():
+        return None
+
+    totals = [(current[codes == k].sum(), land[codes == k].sum(), bldg[codes == k].sum())
+              for k in range(len(labels))]
+
+    def solve(r: float) -> np.ndarray:
+        out = current.copy()
+        for k, (t, l_sum, b_sum) in enumerate(totals):
+            denom = r * l_sum + b_sum
+            if denom > 0:
+                in_group = codes == k
+                out[in_group] = t * (r * land[in_group] + bldg[in_group]) / denom
+        return out
+
+    if not np.allclose(solve(ratio), new, rtol=1e-3, atol=0.5):
+        print(f"  [info] {city}: ratio slider off — the closed-form split does not reproduce "
+              f"new_tax at {ratio:g}:1 (caps, credits, or held-out parcels)")
+        return None
+
+    return {
+        'ratio': ratio,
+        'today': bool(np.allclose(solve(1.0), current, rtol=1e-3, atol=0.5)),
+        'groups': [{'label': lab, 'T': round(float(t), 2), 'L': round(float(l_sum), 2), 'B': round(float(b_sum), 2)}
+                   for lab, (t, l_sum, b_sum) in zip(labels, totals)],
+        'arrays': (land, bldg, codes),
+    }
 
 
 def _clean(value):
@@ -377,10 +509,12 @@ def _model_label(model_type: str) -> str:
     mt = (model_type or '').strip().lower()
     if not mt:
         return 'land value tax'
-    import re
     m = re.match(r'split_rate_(\d+)to(\d+)', mt)
     if m:
         return f"{m.group(1)}:{m.group(2)} split-rate"
+    ratio = _parse_split_ratio(mt)
+    if ratio is not None:
+        return f"{ratio:g}:1 split-rate"
     m = re.match(r'abatement_(\d+)pct', mt)
     if m:
         return f"{m.group(1)}% building abatement"
@@ -513,6 +647,26 @@ _HTML_TEMPLATE = """<!doctype html>
   .legend .lt{font-weight:650;margin-bottom:5px;font-size:11px;letter-spacing:.03em;text-transform:uppercase;color:var(--muted)}
   .legend .row{display:flex;align-items:center;gap:7px}
   .legend i{width:15px;height:12px;border-radius:2px;flex:none;border:1px solid rgba(0,0,0,.12)}
+  .ratio{font-family:var(--sans);color:var(--ink);background:rgba(255,255,255,.96);width:250px;
+    padding:10px 12px 9px;border-radius:10px;border:1px solid var(--line);box-shadow:0 1px 6px rgba(20,32,42,.1);font-size:12px}
+  @media(max-width:560px){.ratio{width:190px}}
+  .ratio .lt{font-weight:650;font-size:11px;letter-spacing:.03em;text-transform:uppercase;color:var(--muted)}
+  .ratio .rv{display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin-top:2px}
+  .ratio #r-val{font-size:20px;font-weight:650;font-variant-numeric:tabular-nums}
+  .ratio #r-reset{font:inherit;font-size:11.5px;font-weight:600;color:var(--accent);background:none;border:0;padding:0;cursor:pointer}
+  .ratio #r-reset[hidden]{display:none}
+  .ratio #r-reset:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .ratio input[type=range]{width:100%;margin:7px 0 2px;accent-color:var(--accent);cursor:pointer}
+  .ratio .rt{display:flex;justify-content:space-between;color:var(--muted);font-size:10.5px}
+  .ratio .rs{margin-top:6px;color:var(--muted);font-size:11.5px}.ratio .rs b{color:var(--ink);font-weight:650}
+  .rates{margin-top:14px;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px 14px}
+  .rates summary{cursor:pointer;font-weight:600;font-size:13.5px}
+  .rates table{width:100%;border-collapse:collapse;margin-top:8px;font-size:13px}
+  .rates th{text-align:right;font-weight:600;color:var(--muted);font-size:11px;letter-spacing:.03em;text-transform:uppercase;padding:4px 0}
+  .rates th:first-child,.rates td:first-child{text-align:left}
+  .rates td{padding:5px 0;border-top:1px solid var(--line);text-align:right;font-variant-numeric:tabular-nums}
+  .rates td.num{font-family:var(--mono)}
+  .rates .note{margin:8px 0 2px;color:var(--muted);font-size:12px}
   .inspector{background:var(--panel);border:1px solid var(--line);border-radius:12px;
     padding:16px 16px 18px;position:sticky;top:12px;min-height:220px}
   .hint{color:var(--muted);font-size:13px}.hint b{color:var(--ink);font-weight:600}
@@ -566,11 +720,20 @@ _HTML_TEMPLATE = """<!doctype html>
       <div class="hint"><b>Click any parcel</b> to see its parcel number, owner, address, and how its tax bill changes under the reform. Use the layer control to switch between road and satellite.</div>
     </aside>
   </div>
-  <p class="ft"><b>How to read it.</b> Parcels with little building value relative to land (vacant lots, parking) tend to pay more; building-heavy parcels (apartments, offices) tend to pay less. Green = pays less, red = pays more, grey = no current tax to compare. Base maps: Esri World Street Map (road) and Esri World Imagery (satellite).</p>
+  <details class="rates" id="rates" hidden>
+    <summary>Tax rates at this ratio</summary>
+    <table><thead><tr><th>Group</th><th>Land rate</th><th>Building rate</th><th>Revenue</th></tr></thead><tbody id="rates-body"></tbody></table>
+    <p class="note" id="rates-note"></p>
+  </details>
+  <p class="ft"><b>How to read it.</b> Parcels with little building value relative to land (vacant lots, parking) tend to pay more; building-heavy parcels (apartments, offices) tend to pay less. Green = pays less, red = pays more, grey = no current tax to compare. <span id="ft-ratio"></span>Base maps: Esri World Street Map (road) and Esri World Imagery (satellite).</p>
   __GALLERY__
 </div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
+// RATIO is null unless the modeled split can be re-solved in closed form (lvt/parcel_map.py _ratio_slider_spec)
+const RATIO = __RATIO__;
+const COLOR_STOPS = __COLOR_STOPS__;
+const NO_DATA_COLOR = __NO_DATA_COLOR__;
 const DATA = __GEOJSON__;
 const CENTER = __CENTER__;
 
@@ -593,12 +756,17 @@ L.control.layers({ 'Road': roadLayer, 'Satellite': satelliteLayer }, null,
 
 const money = v => v == null ? '\\u2014' : '$' + Math.round(v).toLocaleString();
 const clsOf = p => p == null ? 'flat' : (p > 1 ? 'up' : (p < -1 ? 'dn' : 'flat'));
+const fmtRatio = r => r === Infinity ? 'Land only' : (Number.isInteger(r) ? r : r.toFixed(1)) + ':1';
 const insp = document.getElementById('insp');
+let ratio = RATIO ? RATIO.ratio : null;
 
 let selected = null;
 function inspect(p, lyr) {
   if (selected) layer.resetStyle(selected);
   selected = lyr; lyr.setStyle({ stroke: true, weight: 2.4, color: '#0b1116' }); lyr.bringToFront();
+  renderInspector(p);
+}
+function renderInspector(p) {
   const c = clsOf(p.pct);
   const pct = p.pct == null ? 'no current bill' : (p.pct >= 0 ? '+' : '') + p.pct + '%';
   const chg = p.chg == null ? '\\u2014' : (p.chg >= 0 ? '+' : '\\u2212') + money(Math.abs(p.chg));
@@ -613,7 +781,7 @@ function inspect(p, lyr) {
     '<tr><td class="k">Land value</td><td class="v">' + money(p.land) + '</td></tr>' +
     '<tr><td class="k">Building value</td><td class="v">' + money(p.imp) + '</td></tr>' +
     '<tr><td class="k">Current bill</td><td class="v">' + money(p.cur) + '</td></tr>' +
-    '<tr><td class="k">Under reform</td><td class="v">' + money(p.new) + '</td></tr>' +
+    '<tr><td class="k">' + (ratio ? 'Under ' + fmtRatio(ratio) : 'Under reform') + '</td><td class="v">' + money(p.new) + '</td></tr>' +
     '<tr><td class="k">Change</td><td class="v" style="color:' + chgColor + '">' + chg + '</td></tr>' +
     '</tbody></table>';
   if (p.url) h += '<div class="rec"><a href="' + p.url + '" target="_blank" rel="noopener">View county record &rarr;</a></div>';
@@ -645,18 +813,102 @@ legend.onAdd = function () {
 };
 legend.addTo(map);
 
-// summary chips computed from the embedded data
-const priced = DATA.features.map(f => f.properties.pct).filter(v => v != null).sort((a, b) => a - b);
-const med = priced.length ? priced[Math.floor(priced.length / 2)] : 0;
-const up = priced.length ? Math.round(priced.filter(v => v > 5).length / priced.length * 100) : 0;
-const dn = priced.length ? Math.round(priced.filter(v => v < -5).length / priced.length * 100) : 0;
-const chips = [
-  ['Parcels', DATA.features.length.toLocaleString()],
-  ['Median change', (med >= 0 ? '+' : '') + med.toFixed(1) + '%'],
-  ['Pay less (>5%)', dn + '%'], ['Pay more (>5%)', up + '%']
-];
-document.getElementById('stats').innerHTML = chips.map(
-  c => '<div class="chip"><div class="k">' + c[0] + '</div><div class="v">' + c[1] + '</div></div>').join('');
+// summary chips computed from the embedded data (recomputed when the ratio slider moves)
+const pctStr = v => (v >= 0 ? '+' : '') + v.toFixed(1) + '%';
+function updateStats(landShare) {
+  const priced = DATA.features.map(f => f.properties.pct).filter(v => v != null).sort((a, b) => a - b);
+  const med = priced.length ? priced[Math.floor(priced.length / 2)] : 0;
+  const up = priced.length ? Math.round(priced.filter(v => v > 5).length / priced.length * 100) : 0;
+  const dn = priced.length ? Math.round(priced.filter(v => v < -5).length / priced.length * 100) : 0;
+  const chips = [
+    ['Parcels', DATA.features.length.toLocaleString()],
+    ['Median change', pctStr(med)],
+    ['Pay less (>5%)', dn + '%'], ['Pay more (>5%)', up + '%']
+  ];
+  if (landShare != null) chips.push(['Levy paid by land', Math.round(landShare * 100) + '%']);
+  document.getElementById('stats').innerHTML = chips.map(
+    c => '<div class="chip"><div class="k">' + c[0] + '</div><div class="v">' + c[1] + '</div></div>').join('');
+}
+
+function colorFor(pct) {
+  if (pct == null) return NO_DATA_COLOR;
+  for (const [t, c] of COLOR_STOPS) if (pct <= t) return c;
+  return COLOR_STOPS[COLOR_STOPS.length - 1][1];
+}
+
+// Land:building ratio slider. Within each group the revenue-neutral split is linear in the
+// parcel's basis values: new = T_g * (R * land + bldg) / (R * LAND_g + BLDG_g).
+function solveGroups(r) {
+  return RATIO.groups.map(g => {
+    const denom = r === Infinity ? g.L : r * g.L + g.B;
+    if (!(denom > 0)) return { k: null, land: null, bldg: null, landRev: 0, T: g.T };
+    const bldgRate = r === Infinity ? 0 : g.T / denom;
+    const landRate = r === Infinity ? g.T / g.L : r * bldgRate;
+    return { k: g.T / denom, land: landRate * 1000, bldg: bldgRate * 1000, landRev: landRate * g.L, T: g.T };
+  });
+}
+function applyRatio(r) {
+  ratio = r;
+  const solved = solveGroups(r);
+  for (const f of DATA.features) {
+    const p = f.properties, s = solved[p.g];
+    p.new = s.k == null ? p.cur : s.k * (r === Infinity ? p.bl : r * p.bl + p.bi);
+    p.chg = p.cur == null ? null : p.new - p.cur;
+    p.pct = p.cur > 0 ? Math.round(p.chg / p.cur * 1000) / 10 : null;
+    p.c = colorFor(p.pct);
+  }
+  layer.setStyle(f => ({ fillColor: f.properties.c }));
+  const total = solved.reduce((a, s) => a + s.T, 0);
+  const landShare = total > 0 ? solved.reduce((a, s) => a + s.landRev, 0) / total : null;
+  updateStats(landShare);
+  document.getElementById('r-val').textContent = fmtRatio(r);
+  document.getElementById('r-reset').hidden = r === RATIO.ratio;
+  document.getElementById('r-share').innerHTML = r === 1 && RATIO.today
+    ? 'Today\\u2019s bills: no change.'
+    : 'Land pays <b>' + Math.round(landShare * 100) + '%</b> of the levy.';
+  const rate = v => v == null ? '\\u2014' : v.toFixed(2);
+  document.getElementById('rates-body').innerHTML = RATIO.groups.map((g, i) =>
+    '<tr><td>' + g.label + '</td><td class="num">' + rate(solved[i].land) + '</td><td class="num">' +
+    rate(solved[i].bldg) + '</td><td class="num">' + money(g.T) + '</td></tr>').join('');
+  if (selected) renderInspector(selected.feature.properties);
+}
+
+if (RATIO) {
+  const STOPS = [1, 1.5, 2, 3, 4, 5, 6, 8, 10, 15, 20, Infinity];
+  if (!STOPS.includes(RATIO.ratio)) { STOPS.push(RATIO.ratio); STOPS.sort((a, b) => a - b); }
+  const ctl = L.control({ position: 'bottomleft' });
+  ctl.onAdd = function () {
+    const div = L.DomUtil.create('div', 'ratio');
+    div.innerHTML = '<div class="lt">Land : building tax ratio</div>' +
+      '<div class="rv"><span id="r-val"></span><button id="r-reset" type="button">Reset to ' + fmtRatio(RATIO.ratio) + '</button></div>' +
+      '<input id="r-in" type="range" min="0" max="' + (STOPS.length - 1) + '" step="1" value="' +
+      STOPS.indexOf(RATIO.ratio) + '" aria-label="Land to building tax ratio"/>' +
+      '<div class="rt"><span>' + (RATIO.today ? '1:1 (today)' : '1:1 (flat rate)') + '</span><span>Land only</span></div>' +
+      '<div class="rs" id="r-share"></div>';
+    L.DomEvent.disableClickPropagation(div);
+    L.DomEvent.disableScrollPropagation(div);
+    return div;
+  };
+  ctl.addTo(map);
+  const rin = document.getElementById('r-in');
+  let pending = null;
+  rin.addEventListener('input', () => {
+    if (pending) return;
+    pending = requestAnimationFrame(() => { pending = null; applyRatio(STOPS[+rin.value]); });
+  });
+  document.getElementById('r-reset').addEventListener('click', () => {
+    rin.value = STOPS.indexOf(RATIO.ratio); applyRatio(RATIO.ratio);
+  });
+  document.getElementById('rates').hidden = false;
+  document.getElementById('rates-note').textContent = RATIO.groups.length > 1
+    ? 'Each group is solved separately and keeps its current revenue. Rates are per $1,000 of the value each group taxes.'
+    : 'Rates are per $1,000 of taxable value.';
+  document.getElementById('ft-ratio').textContent = 'The ratio slider re-solves the revenue-neutral split in your browser; ' +
+    'the charts below show the modeled ' + fmtRatio(RATIO.ratio) + ' split. ';
+  applyRatio(RATIO.ratio);
+} else {
+  updateStats(null);
+}
 
 // full-screen toggle
 const mapbox = document.getElementById('mapbox');
@@ -681,18 +933,18 @@ if (gvThumbs.length) {
   const gvCap = document.getElementById('gv-cap');
   const gvCount = document.getElementById('gv-count');
   let gi = 0;
-  function showChart(i) {
+  function showChart(i, scroll = true) {
     gi = (i + gvThumbs.length) % gvThumbs.length;
     gvMain.src = gvThumbs[gi].src;
     gvCap.textContent = gvThumbs[gi].dataset.title;
     gvCount.textContent = (gi + 1) + ' / ' + gvThumbs.length;
     gvThumbs.forEach((t, k) => t.classList.toggle('active', k === gi));
-    gvThumbs[gi].scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    if (scroll) gvThumbs[gi].scrollIntoView({ block: 'nearest', inline: 'nearest' });
   }
   document.getElementById('gv-prev').addEventListener('click', () => showChart(gi - 1));
   document.getElementById('gv-next').addEventListener('click', () => showChart(gi + 1));
   gvThumbs.forEach((t, k) => t.addEventListener('click', () => showChart(k)));
-  showChart(0);
+  showChart(0, false);  // no scroll on load, or the page opens at the gallery instead of the map
 }
 </script>
 </body>

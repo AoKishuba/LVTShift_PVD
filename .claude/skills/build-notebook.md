@@ -355,6 +355,19 @@ print("Done.")
 as a click-through chart gallery below the map, so it must run **after** `create_city_report`
 (and after any custom chart cells) — as it does in the closing pattern above.
 
+**Land : building ratio slider.** For a pure split-rate model (`MODEL_TYPE` like `split_rate:4.0`
+or `split_rate_4to1`) the inline map adds a slider that re-solves the revenue-neutral split in the
+browser at any ratio from 1:1 to land only, with live stats, per-group rates, and the parcel
+inspector following along. A split solved within group *g* is linear in its basis values
+(`new = T_g × (R·land + bldg) / (R·LAND_g + BLDG_g)`), so no re-run is needed. A plain single-group
+model gets the slider with no extra work. A model solved **per class or on adjusted values** sets three
+columns on `gdf` before the closing cells (the closing pattern itself is unchanged; the exporter
+carries them through): `ratio_basis_land` / `ratio_basis_improvement` (the values the solver
+used) and `ratio_group` (the solve group; a categorical keeps its order in the rates table).
+See Providence Section 5. `create_parcel_map` turns the slider on only after checking that the
+formula reproduces `new_tax` at the modeled ratio, so models with caps, credits, or held-out
+parcels keep a fixed-ratio map (it prints why). The tiled large-city viewer has no slider.
+
 For **large cities** (more than ~100k parcels) `create_parcel_map` automatically switches
 from the inline single-file HTML to **vector tiles**: it builds `analysis/reports/<city>/<city>.pmtiles`
 via tippecanoe and writes a MapLibre GL viewer. That tiled viewer must be opened over a
