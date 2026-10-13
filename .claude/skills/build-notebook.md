@@ -364,7 +364,7 @@ model gets the slider with no extra work. A model solved **per class or on adjus
 columns on `gdf` before the closing cells (the closing pattern itself is unchanged; the exporter
 carries them through): `ratio_basis_land` / `ratio_basis_improvement` (the values the solver
 used) and `ratio_group` (the solve group; a categorical keeps its order in the rates table).
-See Providence Section 5. `create_parcel_map` turns the slider on only after checking that the
+See `cities/providence/model_per_class.ipynb` Section 5. `create_parcel_map` turns the slider on only after checking that the
 formula reproduces `new_tax` at the modeled ratio, so models with caps, credits, or held-out
 parcels keep a fixed-ratio map (it prints why). The tiled large-city viewer has no slider.
 
