@@ -351,6 +351,11 @@ print("Done.")
 > vacant + underdeveloped land (improvement ratio <10% / 10-25% / 25-50%) as a share of the
 > base. Roll up across cities with `lvt.metrics.rollup_city_metrics()`.
 
+**Shared lots.** Tax accounts that share an identical lot polygon (every unit of a condo building, or a
+building account on a separately assessed ground lot) are drawn once on the inline map, with their bills
+added together and colored by the lot's total change; clicking the lot lists each account. The summary
+chips still count tax accounts, like the report charts, and the export keeps one row per account.
+
 `create_parcel_map` also embeds every report PNG sitting in `analysis/reports/<city>/`
 as a click-through chart gallery below the map, so it must run **after** `create_city_report`
 (and after any custom chart cells) — as it does in the closing pattern above.

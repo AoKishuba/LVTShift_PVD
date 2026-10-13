@@ -27,7 +27,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from typing import Optional
+from typing import List, Optional
 from urllib.parse import quote
 
 import geopandas as gpd
@@ -306,6 +306,11 @@ def create_parcel_map(
             f"to the inline Leaflet map (this file will be large)."
         )
 
+    # Several tax accounts can share one identical lot polygon (every unit of a condo building, or a
+    # building account on a separately assessed ground lot). Stacked, only the top account would be
+    # visible and clickable, so each polygon is drawn once with its accounts' bills added together.
+    lot_keys = gdf.geometry.apply(lambda g: None if g is None or g.is_empty else g.wkb).to_numpy()
+
     if simplify_tolerance_m:
         merc = gdf.geometry.to_crs(WEB_MERCATOR).simplify(
             simplify_tolerance_m, preserve_topology=True)
@@ -315,10 +320,9 @@ def create_parcel_map(
     if slider is not None:
         basis_land, basis_bldg, group_codes = slider.pop('arrays')
 
-    features = []
+    lots = {}
     for i, row in enumerate(gdf.itertuples(index=False)):
-        geom = getattr(row, 'geometry')
-        if geom is None or geom.is_empty:
+        if lot_keys[i] is None:
             continue
         pct = getattr(row, 'tax_change_pct', None)
         pct = None if pct is None or (isinstance(pct, float) and np.isnan(pct)) else float(pct)
@@ -338,9 +342,19 @@ def create_parcel_map(
         }
         if slider is not None:
             props.update({'bl': _num(basis_land[i]), 'bi': _num(basis_bldg[i]), 'g': int(group_codes[i])})
+        lots.setdefault(lot_keys[i], []).append((i, props))
+
+    features = []
+    n_accounts = 0
+    for members in lots.values():
+        geom = gdf.geometry.iloc[members[0][0]]
+        if geom is None or geom.is_empty:
+            continue
+        accounts = [props for _, props in members]
+        n_accounts += len(accounts)
         features.append({
             'type': 'Feature',
-            'properties': props,
+            'properties': accounts[0] if len(accounts) == 1 else _merge_lot(accounts),
             'geometry': _round_geometry(geom.__geo_interface__, coord_precision),
         })
 
@@ -389,8 +403,43 @@ def create_parcel_map(
     if slider is not None:
         slider_note = (f"; ratio slider at {slider['ratio']:g}:1 over {len(slider['groups'])} group(s)"
                        f"{', 1:1 = current bills' if slider['today'] else ''}")
-    print(f"  ✓ {city}: interactive map → {out_path}  [{len(features):,} parcels{slider_note}]")
+    print(f"  ✓ {city}: interactive map → {out_path}  [{n_accounts:,} accounts on {len(features):,} lots{slider_note}]")
     return out_path
+
+
+def _merge_lot(accounts: List[dict]) -> dict:
+    """One map feature for several tax accounts drawn on the same lot polygon.
+
+    Parameters
+    ----------
+    accounts : list of dict
+        Per-account feature properties (as built in ``create_parcel_map``).
+
+    Returns
+    -------
+    dict
+        Lot-level properties: summed values and bills, the lot's percentage change
+        and color, and the accounts themselves under ``u`` for the inspector and the
+        ratio slider (which re-solves each account and re-adds them).
+    """
+    def total(key):
+        vals = [a[key] for a in accounts if a.get(key) is not None]
+        return round(sum(vals), 2) if vals else None
+
+    cur, new = total('cur'), total('new')
+    chg = None if cur is None or new is None else round(new - cur, 2)
+    pct = round(chg / cur * 100, 1) if chg is not None and cur > 0 else None
+    cats = list(dict.fromkeys(a['cat'] for a in accounts if a.get('cat')))
+    adrs = list(dict.fromkeys(a['adr'] for a in accounts if a.get('adr')))
+    keep = ('pid', 'url', 'own', 'adr', 'cur', 'new', 'pct', 'bl', 'bi', 'g')
+    return {
+        'pid': None, 'url': None, 'own': None,
+        'adr': ' · '.join(adrs[:3]) + (f' + {len(adrs) - 3} more' if len(adrs) > 3 else ''),
+        'cat': cats[0] if len(cats) == 1 else ' / '.join(cats),
+        'land': total('land'), 'imp': total('imp'),
+        'cur': cur, 'new': new, 'chg': chg, 'pct': pct, 'c': _color_for(pct),
+        'u': [{k: a[k] for k in keep if k in a} for a in accounts],
+    }
 
 
 def _parse_split_ratio(model_type: str) -> Optional[float]:
@@ -683,6 +732,16 @@ _HTML_TEMPLATE = """<!doctype html>
   table.kv td.v{text-align:right;font-variant-numeric:tabular-nums;font-family:var(--mono)}
   .rec{margin-top:12px;font-size:12.5px}.rec a{color:var(--accent);font-weight:600;text-decoration:none}
   .rec a:hover{text-decoration:underline}
+  .units{margin-top:14px}
+  .units-h{font-size:11px;letter-spacing:.03em;text-transform:uppercase;color:var(--muted);font-weight:650;margin-bottom:4px}
+  .units-scroll{max-height:280px;overflow:auto;border-top:1px solid var(--line)}
+  table.ut{width:100%;border-collapse:collapse;font-size:12px}
+  table.ut th{position:sticky;top:0;background:var(--panel);font-size:10.5px;font-weight:600;color:var(--muted);
+    text-align:right;padding:5px 0 4px 6px;border-bottom:1px solid var(--line)}
+  table.ut td{padding:5px 0 5px 5px;border-top:1px solid var(--line);text-align:right;vertical-align:top;font-variant-numeric:tabular-nums;white-space:nowrap}
+  table.ut th:first-child,table.ut td:first-child{text-align:left;padding-left:0}
+  table.ut .ua{font-family:var(--mono);font-size:11px}.ut a{color:var(--accent);text-decoration:none}
+  table.ut .uo{color:var(--muted);font-size:11px;max-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .ft{margin-top:16px;color:var(--muted);font-size:12px;max-width:84ch}.ft b{color:var(--ink);font-weight:600}
   .gallery{margin-top:26px;border-top:1px solid var(--line);padding-top:20px}
   .gv-h{font-size:16px;font-weight:650;margin:0;letter-spacing:-.01em}
@@ -725,7 +784,7 @@ _HTML_TEMPLATE = """<!doctype html>
     <table><thead><tr><th>Group</th><th>Land rate</th><th>Building rate</th><th>Revenue</th></tr></thead><tbody id="rates-body"></tbody></table>
     <p class="note" id="rates-note"></p>
   </details>
-  <p class="ft"><b>How to read it.</b> Parcels with little building value relative to land (vacant lots, parking) tend to pay more; building-heavy parcels (apartments, offices) tend to pay less. Green = pays less, red = pays more, grey = no current tax to compare. <span id="ft-ratio"></span>Base maps: Esri World Street Map (road) and Esri World Imagery (satellite).</p>
+  <p class="ft"><b>How to read it.</b> Parcels with little building value relative to land (vacant lots, parking) tend to pay more; building-heavy parcels (apartments, offices) tend to pay less. Green = pays less, red = pays more, grey = no current tax to compare. Lots shared by several tax accounts (each unit of a condo building) are drawn once, with their bills added together; click one to see every account. <span id="ft-ratio"></span>Base maps: Esri World Street Map (road) and Esri World Imagery (satellite).</p>
   __GALLERY__
 </div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -766,25 +825,39 @@ function inspect(p, lyr) {
   selected = lyr; lyr.setStyle({ stroke: true, weight: 2.4, color: '#0b1116' }); lyr.bringToFront();
   renderInspector(p);
 }
+const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[ch]);
+const pctText = v => v == null ? '\\u2014' : (v >= 0 ? '+' : '') + v.toFixed(1) + '%';
+const toneOf = c => c === 'up' ? 'var(--pos)' : (c === 'dn' ? 'var(--neg)' : 'inherit');
 function renderInspector(p) {
   const c = clsOf(p.pct);
-  const pct = p.pct == null ? 'no current bill' : (p.pct >= 0 ? '+' : '') + p.pct + '%';
+  const pct = p.pct == null ? 'no current bill' : pctText(p.pct);
   const chg = p.chg == null ? '\\u2014' : (p.chg >= 0 ? '+' : '\\u2212') + money(Math.abs(p.chg));
   const label = c === 'up' ? 'Pays more' : (c === 'dn' ? 'Pays less' : '~ Neutral');
-  const chgColor = c === 'up' ? 'var(--pos)' : (c === 'dn' ? 'var(--neg)' : 'inherit');
-  let h = '<div class="ins-cat">' + (p.cat || '') + '</div>' +
-    '<div class="ins-id">Parcel ' + (p.pid || '\\u2014') + '</div>';
-  if (p.adr) h += '<div class="ins-adr">' + p.adr + '</div>';
-  if (p.own) h += '<div class="ins-own">' + p.own + '</div>';
-  h += '<div class="pill ' + c + '">' + label + ' \\u00b7 ' + pct + '</div>' +
+  const under = ratio ? 'Under ' + fmtRatio(ratio) : 'Under reform';
+  const shared = !!p.u;
+  let h = '<div class="ins-cat">' + esc(p.cat) + (shared ? ' \\u00b7 ' + p.u.length + ' tax accounts' : '') + '</div>' +
+    '<div class="ins-id">' + (shared ? 'Shared lot' : 'Parcel ' + esc(p.pid || '\\u2014')) + '</div>';
+  if (p.adr) h += '<div class="ins-adr">' + esc(p.adr) + '</div>';
+  if (p.own) h += '<div class="ins-own">' + esc(p.own) + '</div>';
+  h += '<div class="pill ' + c + '">' + label + (shared ? ' in total' : '') + ' \\u00b7 ' + pct + '</div>' +
     '<table class="kv"><tbody>' +
     '<tr><td class="k">Land value</td><td class="v">' + money(p.land) + '</td></tr>' +
     '<tr><td class="k">Building value</td><td class="v">' + money(p.imp) + '</td></tr>' +
-    '<tr><td class="k">Current bill</td><td class="v">' + money(p.cur) + '</td></tr>' +
-    '<tr><td class="k">' + (ratio ? 'Under ' + fmtRatio(ratio) : 'Under reform') + '</td><td class="v">' + money(p.new) + '</td></tr>' +
-    '<tr><td class="k">Change</td><td class="v" style="color:' + chgColor + '">' + chg + '</td></tr>' +
+    '<tr><td class="k">' + (shared ? 'Current bills' : 'Current bill') + '</td><td class="v">' + money(p.cur) + '</td></tr>' +
+    '<tr><td class="k">' + under + '</td><td class="v">' + money(p.new) + '</td></tr>' +
+    '<tr><td class="k">Change</td><td class="v" style="color:' + toneOf(c) + '">' + chg + '</td></tr>' +
     '</tbody></table>';
-  if (p.url) h += '<div class="rec"><a href="' + p.url + '" target="_blank" rel="noopener">View county record &rarr;</a></div>';
+  if (shared) {
+    h += '<div class="units"><div class="units-h">Each tax account</div><div class="units-scroll"><table class="ut"><thead><tr>' +
+      '<th>Account</th><th>Now</th><th>' + under.replace('Under ', '') + '</th><th>Change</th></tr></thead><tbody>' +
+      p.u.map(a => {
+        const id = a.url ? '<a href="' + esc(a.url) + '" target="_blank" rel="noopener">' + esc(a.pid) + '</a>' : esc(a.pid || '\\u2014');
+        const who = [a.adr, a.own].filter(Boolean).map(esc).join(' \\u00b7 ');
+        return '<tr><td><div class="ua">' + id + '</div><div class="uo" title="' + who + '">' + who + '</div></td>' +
+          '<td>' + money(a.cur) + '</td><td>' + money(a.new) + '</td>' +
+          '<td style="color:' + toneOf(clsOf(a.pct)) + '">' + pctText(a.pct) + '</td></tr>';
+      }).join('') + '</tbody></table></div></div>';
+  } else if (p.url) h += '<div class="rec"><a href="' + esc(p.url) + '" target="_blank" rel="noopener">View county record &rarr;</a></div>';
   else h += '<div class="rec" style="color:var(--muted)">No public record link for this jurisdiction.</div>';
   insp.innerHTML = h;
 }
@@ -813,16 +886,18 @@ legend.onAdd = function () {
 };
 legend.addTo(map);
 
-// summary chips computed from the embedded data (recomputed when the ratio slider moves)
-const pctStr = v => (v >= 0 ? '+' : '') + v.toFixed(1) + '%';
+// One entry per tax account: a shared lot's accounts live in p.u, a single-account lot is its own entry.
+// Summary chips count tax bills (as the report charts do), not map lots.
+const ACCOUNTS = DATA.features.flatMap(f => f.properties.u || [f.properties]);
 function updateStats(landShare) {
-  const priced = DATA.features.map(f => f.properties.pct).filter(v => v != null).sort((a, b) => a - b);
+  const priced = ACCOUNTS.map(a => a.pct).filter(v => v != null).sort((a, b) => a - b);
   const med = priced.length ? priced[Math.floor(priced.length / 2)] : 0;
   const up = priced.length ? Math.round(priced.filter(v => v > 5).length / priced.length * 100) : 0;
   const dn = priced.length ? Math.round(priced.filter(v => v < -5).length / priced.length * 100) : 0;
   const chips = [
-    ['Parcels', DATA.features.length.toLocaleString()],
-    ['Median change', pctStr(med)],
+    ['Tax accounts', ACCOUNTS.length.toLocaleString()],
+    ['Lots on map', DATA.features.length.toLocaleString()],
+    ['Median change', pctText(med)],
     ['Pay less (>5%)', dn + '%'], ['Pay more (>5%)', up + '%']
   ];
   if (landShare != null) chips.push(['Levy paid by land', Math.round(landShare * 100) + '%']);
@@ -850,11 +925,18 @@ function solveGroups(r) {
 function applyRatio(r) {
   ratio = r;
   const solved = solveGroups(r);
-  for (const f of DATA.features) {
-    const p = f.properties, s = solved[p.g];
-    p.new = s.k == null ? p.cur : s.k * (r === Infinity ? p.bl : r * p.bl + p.bi);
+  const settle = p => {
     p.chg = p.cur == null ? null : p.new - p.cur;
     p.pct = p.cur > 0 ? Math.round(p.chg / p.cur * 1000) / 10 : null;
+  };
+  for (const a of ACCOUNTS) {
+    const s = solved[a.g];
+    a.new = s.k == null ? a.cur : s.k * (r === Infinity ? a.bl : r * a.bl + a.bi);
+    settle(a);
+  }
+  for (const f of DATA.features) {
+    const p = f.properties;
+    if (p.u) { p.new = p.u.reduce((t, a) => t + a.new, 0); settle(p); }
     p.c = colorFor(p.pct);
   }
   layer.setStyle(f => ({ fillColor: f.properties.c }));

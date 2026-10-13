@@ -1,4 +1,6 @@
-"""Tests for the parcel map's land:building ratio slider (lvt.parcel_map._ratio_slider_spec)."""
+"""Tests for the parcel map (lvt.parcel_map): the land:building ratio slider and shared-lot merging."""
+import json
+import re
 import sys
 from pathlib import Path
 
@@ -9,7 +11,7 @@ from shapely.geometry import box
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from lvt.lvt_utils import model_split_rate_tax
-from lvt.parcel_map import _parse_split_ratio, _ratio_slider_spec
+from lvt.parcel_map import _parse_split_ratio, _ratio_slider_spec, create_parcel_map
 
 
 def _parcels(rate=10.0):
@@ -86,3 +88,22 @@ def test_per_group_basis_keeps_group_order_and_revenue():
     # treating the two classes as one group no longer reproduces the per-class model
     pooled = modeled.drop(columns=['ratio_group'])
     assert _ratio_slider_spec(_as_export(pooled), 'testcity') is None
+
+
+def test_accounts_sharing_a_lot_polygon_are_drawn_once(tmp_path):
+    # two condo units on one lot polygon, two separate lots
+    export = _as_export(_split(_parcels(), 4.0))
+    export['parcel_id'] = ['A-1', 'A-2', 'B', 'C']
+    export = export.set_geometry([box(0, 0, 1, 1), box(0, 0, 1, 1), box(2, 0, 3, 1), box(4, 0, 5, 1)])
+    out = create_parcel_map(export, 'testcity', output_dir=str(tmp_path), simplify_tolerance_m=None)
+    html = Path(out).read_text()
+    data = json.loads(re.search(r'const DATA = (.*?);\nconst CENTER', html, flags=re.S).group(1))
+    lots = [f['properties'] for f in data['features']]
+    assert len(lots) == 3
+    shared = next(p for p in lots if 'u' in p)
+    assert [a['pid'] for a in shared['u']] == ['A-1', 'A-2']
+    units = export[export['parcel_id'].isin(['A-1', 'A-2'])]
+    assert np.isclose(shared['cur'], units['current_tax'].sum())
+    assert np.isclose(shared['new'], units['new_tax'].sum())
+    assert np.isclose(shared['pct'], round((units['new_tax'].sum() / units['current_tax'].sum() - 1) * 100, 1))
+    assert all('bl' in a and 'g' in a for a in shared['u'])   # each unit is re-solved by the ratio slider
