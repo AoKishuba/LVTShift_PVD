@@ -356,6 +356,14 @@ building account on a separately assessed ground lot) are drawn once on the inli
 added together and colored by the lot's total change; clicking the lot lists each account. The summary
 chips still count tax accounts, like the report charts, and the export keeps one row per account.
 
+**Comparing two models on one map.** `create_parcel_map(..., alternative={...})` adds a checkbox that
+switches the whole page (colors, stats, ratio slider, rates table, inspector, chart gallery) to a second
+model of the same tax accounts, lined up by `parcel_id`; both exports must cover the same accounts with the
+same current tax. Keys: `source` and `label` (required), `note`, `primary_note`, `charts_dir`; pass
+`charts_dir=` for the primary model's PNGs when writing outside `analysis/reports/<city>/`. Build it in a small
+city script run after both notebooks, outside the closing pattern; see `cities/providence/build_comparison_map.py`.
+Inline map only.
+
 `create_parcel_map` also embeds every report PNG sitting in `analysis/reports/<city>/`
 as a click-through chart gallery below the map, so it must run **after** `create_city_report`
 (and after any custom chart cells) — as it does in the closing pattern above.

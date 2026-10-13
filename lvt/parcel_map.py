@@ -235,6 +235,8 @@ def create_parcel_map(
     simplify_tolerance_m: Optional[float] = 2.0,
     title: Optional[str] = None,
     tile_threshold: Optional[int] = 100_000,
+    charts_dir: Optional[str] = None,
+    alternative: Optional[dict] = None,
 ) -> str:
     """Render an interactive HTML parcel map.
 
@@ -272,6 +274,17 @@ def create_parcel_map(
         embed full-resolution geometry.
     title : str, optional
         Map heading. Defaults to a generated title.
+    charts_dir : str, optional
+        Directory holding the report PNGs for the chart gallery. Defaults to
+        ``{output_dir}/{city}``, where ``create_city_report`` writes them.
+    alternative : dict, optional
+        A second model of the same tax accounts, shown when the viewer ticks a
+        checkbox on the map (inline map only). Keys: ``source`` (GeoParquet path
+        or GeoDataFrame from ``save_parcel_map_export``; required), ``label``
+        (checkbox text; required), ``note`` and ``primary_note`` (one-line
+        descriptions of the alternative and of ``source``'s model), and
+        ``charts_dir`` (that model's report PNGs). Both exports must hold the same
+        ``parcel_id`` values and the same current tax for each.
 
     Returns
     -------
@@ -296,9 +309,13 @@ def create_parcel_map(
     if gdf.crs is None or gdf.crs.to_epsg() != 4326:
         gdf = gdf.to_crs(WGS84)
 
+    alt = _align_alternative(gdf, alternative) if alternative is not None else None
+
     # Large cities → vector tiles (PMTiles) + MapLibre, if tippecanoe is available.
     if tile_threshold and len(gdf) > tile_threshold:
         if _have_tippecanoe():
+            if alt is not None:
+                print(f"  [warn] {city}: the tiled viewer has no model checkbox; showing the primary model only")
             return create_parcel_tile_map(gdf, city, output_dir=output_dir, title=title)
         print(
             f"  [warn] {city}: {len(gdf):,} parcels exceeds tile_threshold "
@@ -316,9 +333,15 @@ def create_parcel_map(
             simplify_tolerance_m, preserve_topology=True)
         gdf = gdf.set_geometry(gpd.GeoSeries(merc, crs=WEB_MERCATOR)).to_crs(WGS84)
 
-    slider = _ratio_slider_spec(gdf, city)
-    if slider is not None:
-        basis_land, basis_bldg, group_codes = slider.pop('arrays')
+    # Model 0 is `source`; model 1 the optional alternative. Each account carries, per model k, the
+    # slider basis (bl{k}, bi{k}, g{k}) when that model re-solves in closed form, else its fixed new tax (n{k}).
+    model_frames = [gdf] + ([alt] if alt is not None else [])
+    specs, model_arrays = [], []
+    for k, frame in enumerate(model_frames):
+        spec = _ratio_slider_spec(frame, city if k == 0 else f'{city} (alternative)')
+        model_arrays.append(spec.pop('arrays') if spec is not None
+                            else pd.to_numeric(frame['new_tax'], errors='coerce').to_numpy())
+        specs.append(spec)
 
     lots = {}
     for i, row in enumerate(gdf.itertuples(index=False)):
@@ -340,8 +363,12 @@ def create_parcel_map(
             'pct': None if pct is None else round(pct, 1),
             'c': _color_for(pct),
         }
-        if slider is not None:
-            props.update({'bl': _num(basis_land[i]), 'bi': _num(basis_bldg[i]), 'g': int(group_codes[i])})
+        for k, (spec, arrays) in enumerate(zip(specs, model_arrays)):
+            if spec is not None:
+                basis_land, basis_bldg, group_codes = arrays
+                props.update({f'bl{k}': _num(basis_land[i]), f'bi{k}': _num(basis_bldg[i]), f'g{k}': int(group_codes[i])})
+            else:
+                props[f'n{k}'] = _num(arrays[i])
         lots.setdefault(lot_keys[i], []).append((i, props))
 
     features = []
@@ -374,22 +401,31 @@ def create_parcel_map(
         f"a revenue-neutral {model_label}. Green = pays less, red = pays more. "
         f"Toggle the road / satellite base map, and click a parcel to inspect it."
     )
-    if slider is not None:
+    if any(spec is not None for spec in specs):
         subtitle += (" Drag the land : building ratio slider on the map to re-solve the "
                      "revenue-neutral split at any ratio.")
+    if alt is not None:
+        subtitle += f" Tick “{alternative['label']}” on the map to switch to the alternative model."
     out_city_dir = os.path.join(output_dir, city)
     os.makedirs(out_city_dir, exist_ok=True)
     out_path = os.path.join(out_city_dir, 'parcel_map.html')
 
-    # Click-through gallery of the report PNGs sitting alongside this HTML.
-    # create_city_report runs before create_parcel_map in the notebook, so they exist.
-    gallery = _build_gallery(out_city_dir)
+    # Click-through gallery of the report PNGs (one set per model). create_city_report runs
+    # before create_parcel_map in the notebook, so the primary model's charts exist.
+    chart_sets = [charts_dir or out_city_dir]
+    if alt is not None:
+        chart_sets.append(alternative.get('charts_dir') or '')
+    gallery = _build_gallery(out_city_dir, sets=chart_sets)
+
+    models = [{'spec': specs[0], 'note': (alternative or {}).get('primary_note', '')}]
+    if alt is not None:
+        models.append({'spec': specs[1], 'note': alternative.get('note', ''), 'label': alternative['label']})
 
     html_doc = (
         _HTML_TEMPLATE
         .replace('__TITLE__', html.escape(heading))
         .replace('__SUBTITLE__', html.escape(subtitle))
-        .replace('__RATIO__', json.dumps(slider))
+        .replace('__MODELS__', json.dumps(models))
         .replace('__COLOR_STOPS__', json.dumps(
             [[t if np.isfinite(t) else 1e12, c] for t, c in _COLOR_STOPS]))
         .replace('__NO_DATA_COLOR__', json.dumps(_NO_DATA_COLOR))
@@ -399,12 +435,58 @@ def create_parcel_map(
     )
     with open(out_path, 'w', encoding='utf-8') as fh:
         fh.write(html_doc)
-    slider_note = ''
-    if slider is not None:
-        slider_note = (f"; ratio slider at {slider['ratio']:g}:1 over {len(slider['groups'])} group(s)"
-                       f"{', 1:1 = current bills' if slider['today'] else ''}")
+    notes = []
+    for k, spec in enumerate(specs):
+        name = 'model' if alt is None else ('primary model' if k == 0 else 'alternative model')
+        if spec is not None:
+            notes.append(f"{name}: ratio slider at {spec['ratio']:g}:1 over {len(spec['groups'])} group(s)"
+                         f"{', 1:1 = current bills' if spec['today'] else ''}")
+        elif alt is not None:
+            notes.append(f'{name}: fixed ratio')
+    if alt is not None:
+        notes.append(f"checkbox “{alternative['label']}”")
+    slider_note = ''.join('; ' + n for n in notes)
     print(f"  ✓ {city}: interactive map → {out_path}  [{n_accounts:,} accounts on {len(features):,} lots{slider_note}]")
     return out_path
+
+
+def _align_alternative(gdf: gpd.GeoDataFrame, alternative: dict) -> gpd.GeoDataFrame:
+    """Load the alternative model's export and order its rows like ``gdf``.
+
+    Parameters
+    ----------
+    gdf : gpd.GeoDataFrame
+        The primary model's map export.
+    alternative : dict
+        ``create_parcel_map``'s ``alternative`` argument (needs ``source`` and ``label``).
+
+    Returns
+    -------
+    gpd.GeoDataFrame
+        The alternative export, one row per ``gdf`` row in the same order.
+
+    Raises
+    ------
+    ValueError
+        If either export lacks unique parcel ids, the two cover different
+        accounts, or their current tax differs (they would not describe the same bills).
+    """
+    for key in ('source', 'label'):
+        if key not in alternative:
+            raise ValueError(f"alternative needs a '{key}' entry")
+    source = alternative['source']
+    alt = gpd.read_parquet(source) if isinstance(source, (str, os.PathLike)) else source
+    for name, frame in (('primary', gdf), ('alternative', alt)):
+        ids = frame['parcel_id'] if 'parcel_id' in frame.columns else None
+        if ids is None or ids.isna().any() or ids.duplicated().any():
+            raise ValueError(f'{name} export needs a unique, non-null parcel_id to line up the two models')
+    if set(gdf['parcel_id']) != set(alt['parcel_id']):
+        raise ValueError('the primary and alternative exports cover different parcel_ids')
+    alt = alt.set_index('parcel_id').loc[gdf['parcel_id']].reset_index()
+    if not np.allclose(pd.to_numeric(alt['current_tax']).to_numpy(),
+                       pd.to_numeric(gdf['current_tax']).to_numpy(), atol=0.5):
+        raise ValueError("the alternative export's current_tax differs from the primary's")
+    return alt
 
 
 def _merge_lot(accounts: List[dict]) -> dict:
@@ -431,14 +513,14 @@ def _merge_lot(accounts: List[dict]) -> dict:
     pct = round(chg / cur * 100, 1) if chg is not None and cur > 0 else None
     cats = list(dict.fromkeys(a['cat'] for a in accounts if a.get('cat')))
     adrs = list(dict.fromkeys(a['adr'] for a in accounts if a.get('adr')))
-    keep = ('pid', 'url', 'own', 'adr', 'cur', 'new', 'pct', 'bl', 'bi', 'g')
+    lot_only = ('cat', 'land', 'imp', 'chg', 'c')  # shown for the lot as a whole, not per account
     return {
         'pid': None, 'url': None, 'own': None,
         'adr': ' · '.join(adrs[:3]) + (f' + {len(adrs) - 3} more' if len(adrs) > 3 else ''),
         'cat': cats[0] if len(cats) == 1 else ' / '.join(cats),
         'land': total('land'), 'imp': total('imp'),
         'cur': cur, 'new': new, 'chg': chg, 'pct': pct, 'c': _color_for(pct),
-        'u': [{k: a[k] for k in keep if k in a} for a in accounts],
+        'u': [{k: v for k, v in a.items() if k not in lot_only} for a in accounts],
     }
 
 
@@ -597,31 +679,45 @@ def _pretty_chart_title(filename: str) -> str:
     return words[:1].upper() + words[1:]
 
 
-def _build_gallery(city_dir: str, exclude: Optional[set] = None) -> str:
-    """Build the click-through chart-gallery HTML fragment by embedding every PNG in
-    ``city_dir`` as a data URI. Returns '' when no charts are present so the section
-    is omitted entirely."""
+def _build_gallery(city_dir: str, exclude: Optional[set] = None, sets: Optional[List[str]] = None) -> str:
+    """Build the click-through chart-gallery HTML fragment by embedding report PNGs as
+    data URIs. Returns '' when no charts are present so the section is omitted entirely.
+
+    Parameters
+    ----------
+    city_dir : str
+        Directory of PNGs, used when ``sets`` is not given.
+    exclude : set, optional
+        PNG file names to leave out.
+    sets : list of str, optional
+        One PNG directory per model (an empty string for a model with no charts).
+        Thumbnails carry ``data-set`` = the model's index so the viewer shows the
+        active model's charts.
+    """
     exclude = exclude or set()
-    pngs = sorted(
-        p for p in glob.glob(os.path.join(city_dir, '*.png'))
-        if os.path.basename(p) not in exclude
-    )
-    if not pngs:
-        return ''
     thumbs = []
-    for i, png in enumerate(pngs):
-        with open(png, 'rb') as fh:
-            b64 = base64.b64encode(fh.read()).decode('ascii')
-        title = html.escape(_pretty_chart_title(png))
-        active = ' active' if i == 0 else ''
-        thumbs.append(
-            f'<img class="gv-thumb{active}" src="data:image/png;base64,{b64}" '
-            f'data-title="{title}" alt="{title}" loading="lazy"/>'
+    for k, chart_dir in enumerate(sets if sets is not None else [city_dir]):
+        if not chart_dir:
+            continue
+        pngs = sorted(
+            p for p in glob.glob(os.path.join(chart_dir, '*.png'))
+            if os.path.basename(p) not in exclude
         )
+        for i, png in enumerate(pngs):
+            with open(png, 'rb') as fh:
+                b64 = base64.b64encode(fh.read()).decode('ascii')
+            title = html.escape(_pretty_chart_title(png))
+            active = ' active' if i == 0 and k == 0 else ''
+            thumbs.append(
+                f'<img class="gv-thumb{active}" src="data:image/png;base64,{b64}" data-set="{k}" '
+                f'data-title="{title}" alt="{title}" loading="lazy"/>'
+            )
+    if not thumbs:
+        return ''
     return (
         '<section class="gallery" aria-label="Modeling analysis charts">'
         '<h2 class="gv-h">Modeling analysis charts</h2>'
-        '<p class="gv-sub">The standard report charts for this city. '
+        '<p class="gv-sub" id="gv-sub">The standard report charts for this city. '
         'Use the arrows or thumbnails to click through them.</p>'
         '<div class="gv-stage">'
         '<button class="gv-arrow" id="gv-prev" aria-label="Previous chart">&#8249;</button>'
@@ -708,6 +804,11 @@ _HTML_TEMPLATE = """<!doctype html>
   .ratio input[type=range]{width:100%;margin:7px 0 2px;accent-color:var(--accent);cursor:pointer}
   .ratio .rt{display:flex;justify-content:space-between;color:var(--muted);font-size:10.5px}
   .ratio .rs{margin-top:6px;color:var(--muted);font-size:11.5px}.ratio .rs b{color:var(--ink);font-weight:650}
+  .ratio .msw{display:flex;align-items:center;gap:7px;font-weight:650;font-size:12.5px;cursor:pointer}
+  .ratio .msw input{width:15px;height:15px;margin:0;accent-color:var(--accent);cursor:pointer}
+  .ratio .mnote{color:var(--muted);font-size:11.5px;margin:3px 0 0 22px}
+  .ratio .msep{border-top:1px solid var(--line);margin:9px -12px 8px}
+  .ratio #r-box[hidden]{display:none}
   .rates{margin-top:14px;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px 14px}
   .rates summary{cursor:pointer;font-weight:600;font-size:13.5px}
   .rates table{width:100%;border-collapse:collapse;margin-top:8px;font-size:13px}
@@ -789,8 +890,9 @@ _HTML_TEMPLATE = """<!doctype html>
 </div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
-// RATIO is null unless the modeled split can be re-solved in closed form (lvt/parcel_map.py _ratio_slider_spec)
-const RATIO = __RATIO__;
+// MODELS[0] is the map's model, MODELS[1] the optional alternative behind the checkbox. A model's spec is
+// null unless its split can be re-solved in closed form (lvt/parcel_map.py _ratio_slider_spec).
+const MODELS = __MODELS__;
 const COLOR_STOPS = __COLOR_STOPS__;
 const NO_DATA_COLOR = __NO_DATA_COLOR__;
 const DATA = __GEOJSON__;
@@ -817,7 +919,9 @@ const money = v => v == null ? '\\u2014' : '$' + Math.round(v).toLocaleString();
 const clsOf = p => p == null ? 'flat' : (p > 1 ? 'up' : (p < -1 ? 'dn' : 'flat'));
 const fmtRatio = r => r === Infinity ? 'Land only' : (Number.isInteger(r) ? r : r.toFixed(1)) + ':1';
 const insp = document.getElementById('insp');
-let ratio = RATIO ? RATIO.ratio : null;
+let mi = 0;  // active model
+const firstSpec = MODELS.map(m => m.spec).find(Boolean);
+let ratio = firstSpec ? firstSpec.ratio : null;
 
 let selected = null;
 function inspect(p, lyr) {
@@ -833,7 +937,7 @@ function renderInspector(p) {
   const pct = p.pct == null ? 'no current bill' : pctText(p.pct);
   const chg = p.chg == null ? '\\u2014' : (p.chg >= 0 ? '+' : '\\u2212') + money(Math.abs(p.chg));
   const label = c === 'up' ? 'Pays more' : (c === 'dn' ? 'Pays less' : '~ Neutral');
-  const under = ratio ? 'Under ' + fmtRatio(ratio) : 'Under reform';
+  const under = MODELS[mi].spec ? 'Under ' + fmtRatio(ratio) : 'Under reform';
   const shared = !!p.u;
   let h = '<div class="ins-cat">' + esc(p.cat) + (shared ? ' \\u00b7 ' + p.u.length + ' tax accounts' : '') + '</div>' +
     '<div class="ins-id">' + (shared ? 'Shared lot' : 'Parcel ' + esc(p.pid || '\\u2014')) + '</div>';
@@ -913,8 +1017,8 @@ function colorFor(pct) {
 
 // Land:building ratio slider. Within each group the revenue-neutral split is linear in the
 // parcel's basis values: new = T_g * (R * land + bldg) / (R * LAND_g + BLDG_g).
-function solveGroups(r) {
-  return RATIO.groups.map(g => {
+function solveGroups(spec, r) {
+  return spec.groups.map(g => {
     const denom = r === Infinity ? g.L : r * g.L + g.B;
     if (!(denom > 0)) return { k: null, land: null, bldg: null, landRev: 0, T: g.T };
     const bldgRate = r === Infinity ? 0 : g.T / denom;
@@ -922,16 +1026,21 @@ function solveGroups(r) {
     return { k: g.T / denom, land: landRate * 1000, bldg: bldgRate * 1000, landRev: landRate * g.L, T: g.T };
   });
 }
-function applyRatio(r) {
-  ratio = r;
-  const solved = solveGroups(r);
-  const settle = p => {
-    p.chg = p.cur == null ? null : p.new - p.cur;
-    p.pct = p.cur > 0 ? Math.round(p.chg / p.cur * 1000) / 10 : null;
-  };
+const settle = p => {
+  p.chg = p.cur == null ? null : p.new - p.cur;
+  p.pct = p.cur > 0 ? Math.round(p.chg / p.cur * 1000) / 10 : null;
+};
+// Re-solve every account under the active model at the current ratio, re-add shared lots, recolor
+function recompute() {
+  const spec = MODELS[mi].spec;
+  const solved = spec ? solveGroups(spec, ratio) : null;
   for (const a of ACCOUNTS) {
-    const s = solved[a.g];
-    a.new = s.k == null ? a.cur : s.k * (r === Infinity ? a.bl : r * a.bl + a.bi);
+    if (solved) {
+      const s = solved[a['g' + mi]], bl = a['bl' + mi], bi = a['bi' + mi];
+      a.new = s.k == null ? a.cur : s.k * (ratio === Infinity ? bl : ratio * bl + bi);
+    } else {
+      a.new = a['n' + mi];
+    }
     settle(a);
   }
   for (const f of DATA.features) {
@@ -940,54 +1049,85 @@ function applyRatio(r) {
     p.c = colorFor(p.pct);
   }
   layer.setStyle(f => ({ fillColor: f.properties.c }));
-  const total = solved.reduce((a, s) => a + s.T, 0);
-  const landShare = total > 0 ? solved.reduce((a, s) => a + s.landRev, 0) / total : null;
+  let landShare = null;
+  if (solved) {
+    const total = solved.reduce((t, s) => t + s.T, 0);
+    landShare = total > 0 ? solved.reduce((t, s) => t + s.landRev, 0) / total : null;
+  }
   updateStats(landShare);
-  document.getElementById('r-val').textContent = fmtRatio(r);
-  document.getElementById('r-reset').hidden = r === RATIO.ratio;
-  document.getElementById('r-share').innerHTML = r === 1 && RATIO.today
+  updateControls(spec, solved, landShare);
+  if (selected) renderInspector(selected.feature.properties);
+}
+function updateControls(spec, solved, landShare) {
+  const el = id => document.getElementById(id);
+  if (el('m-note')) el('m-note').textContent = MODELS[mi].note || '';
+  el('rates').hidden = !spec;
+  if (el('r-box')) el('r-box').hidden = !spec;
+  if (!spec) { el('ft-ratio').textContent = ''; return; }
+  el('r-val').textContent = fmtRatio(ratio);
+  el('r-reset').textContent = 'Reset to ' + fmtRatio(spec.ratio);
+  el('r-reset').hidden = ratio === spec.ratio;
+  el('r-one').textContent = spec.today ? '1:1 (today)' : '1:1 (flat rate)';
+  el('r-share').innerHTML = ratio === 1 && spec.today
     ? 'Today\\u2019s bills: no change.'
     : 'Land pays <b>' + Math.round(landShare * 100) + '%</b> of the levy.';
   const rate = v => v == null ? '\\u2014' : v.toFixed(2);
-  document.getElementById('rates-body').innerHTML = RATIO.groups.map((g, i) =>
-    '<tr><td>' + g.label + '</td><td class="num">' + rate(solved[i].land) + '</td><td class="num">' +
+  el('rates-body').innerHTML = spec.groups.map((g, i) =>
+    '<tr><td>' + esc(g.label) + '</td><td class="num">' + rate(solved[i].land) + '</td><td class="num">' +
     rate(solved[i].bldg) + '</td><td class="num">' + money(g.T) + '</td></tr>').join('');
-  if (selected) renderInspector(selected.feature.properties);
+  el('rates-note').textContent = spec.groups.length > 1
+    ? 'Each group is solved separately and keeps its current revenue. Rates are per $1,000 of the value each group taxes.'
+    : 'Rates are per $1,000 of taxable value.';
+  el('ft-ratio').textContent = 'The ratio slider re-solves the revenue-neutral split in your browser; the charts below show the modeled ' +
+    fmtRatio(spec.ratio) + ' split' + (MODELS.length > 1 ? ' of the selected model. ' : '. ');
 }
 
-if (RATIO) {
+// Map control: the model checkbox (when there is an alternative) above the ratio slider
+if (firstSpec || MODELS.length > 1) {
   const STOPS = [1, 1.5, 2, 3, 4, 5, 6, 8, 10, 15, 20, Infinity];
-  if (!STOPS.includes(RATIO.ratio)) { STOPS.push(RATIO.ratio); STOPS.sort((a, b) => a - b); }
+  for (const m of MODELS) if (m.spec && !STOPS.includes(m.spec.ratio)) STOPS.push(m.spec.ratio);
+  STOPS.sort((a, b) => a - b);
   const ctl = L.control({ position: 'bottomleft' });
   ctl.onAdd = function () {
     const div = L.DomUtil.create('div', 'ratio');
-    div.innerHTML = '<div class="lt">Land : building tax ratio</div>' +
-      '<div class="rv"><span id="r-val"></span><button id="r-reset" type="button">Reset to ' + fmtRatio(RATIO.ratio) + '</button></div>' +
-      '<input id="r-in" type="range" min="0" max="' + (STOPS.length - 1) + '" step="1" value="' +
-      STOPS.indexOf(RATIO.ratio) + '" aria-label="Land to building tax ratio"/>' +
-      '<div class="rt"><span>' + (RATIO.today ? '1:1 (today)' : '1:1 (flat rate)') + '</span><span>Land only</span></div>' +
-      '<div class="rs" id="r-share"></div>';
+    div.innerHTML =
+      (MODELS.length > 1
+        ? '<label class="msw"><input id="m-alt" type="checkbox"/>' + esc(MODELS[1].label) + '</label>' +
+          '<div class="mnote" id="m-note"></div>' + (firstSpec ? '<div class="msep"></div>' : '')
+        : '') +
+      (firstSpec
+        ? '<div id="r-box"><div class="lt">Land : building tax ratio</div>' +
+          '<div class="rv"><span id="r-val"></span><button id="r-reset" type="button"></button></div>' +
+          '<input id="r-in" type="range" min="0" max="' + (STOPS.length - 1) + '" step="1" value="' +
+          STOPS.indexOf(ratio) + '" aria-label="Land to building tax ratio"/>' +
+          '<div class="rt"><span id="r-one"></span><span>Land only</span></div>' +
+          '<div class="rs" id="r-share"></div></div>'
+        : '');
     L.DomEvent.disableClickPropagation(div);
     L.DomEvent.disableScrollPropagation(div);
     return div;
   };
   ctl.addTo(map);
-  const rin = document.getElementById('r-in');
-  let pending = null;
-  rin.addEventListener('input', () => {
-    if (pending) return;
-    pending = requestAnimationFrame(() => { pending = null; applyRatio(STOPS[+rin.value]); });
-  });
-  document.getElementById('r-reset').addEventListener('click', () => {
-    rin.value = STOPS.indexOf(RATIO.ratio); applyRatio(RATIO.ratio);
-  });
-  document.getElementById('rates').hidden = false;
-  document.getElementById('rates-note').textContent = RATIO.groups.length > 1
-    ? 'Each group is solved separately and keeps its current revenue. Rates are per $1,000 of the value each group taxes.'
-    : 'Rates are per $1,000 of taxable value.';
-  document.getElementById('ft-ratio').textContent = 'The ratio slider re-solves the revenue-neutral split in your browser; ' +
-    'the charts below show the modeled ' + fmtRatio(RATIO.ratio) + ' split. ';
-  applyRatio(RATIO.ratio);
+  if (firstSpec) {
+    const rin = document.getElementById('r-in');
+    let pending = null;
+    rin.addEventListener('input', () => {
+      if (pending) return;
+      pending = requestAnimationFrame(() => { pending = null; ratio = STOPS[+rin.value]; recompute(); });
+    });
+    document.getElementById('r-reset').addEventListener('click', () => {
+      ratio = MODELS[mi].spec.ratio; rin.value = STOPS.indexOf(ratio); recompute();
+    });
+  }
+  if (MODELS.length > 1) {
+    // Switching models keeps the slider's ratio, so the two models compare at the same setting
+    document.getElementById('m-alt').addEventListener('change', e => {
+      mi = e.target.checked ? 1 : 0;
+      recompute();
+      showGallerySet(mi);
+    });
+  }
+  recompute();
 } else {
   updateStats(null);
 }
@@ -1008,25 +1148,36 @@ function onFsChange() {
 document.addEventListener('fullscreenchange', onFsChange);
 document.addEventListener('webkitfullscreenchange', onFsChange);
 
-// chart gallery — click through the report PNGs
-const gvThumbs = Array.from(document.querySelectorAll('.gv-thumb'));
-if (gvThumbs.length) {
-  const gvMain = document.getElementById('gv-main');
-  const gvCap = document.getElementById('gv-cap');
-  const gvCount = document.getElementById('gv-count');
-  let gi = 0;
-  function showChart(i, scroll = true) {
-    gi = (i + gvThumbs.length) % gvThumbs.length;
-    gvMain.src = gvThumbs[gi].src;
-    gvCap.textContent = gvThumbs[gi].dataset.title;
-    gvCount.textContent = (gi + 1) + ' / ' + gvThumbs.length;
-    gvThumbs.forEach((t, k) => t.classList.toggle('active', k === gi));
-    if (scroll) gvThumbs[gi].scrollIntoView({ block: 'nearest', inline: 'nearest' });
+// chart gallery — click through the report PNGs (one set per model; the active model's set is shown)
+const gvAll = Array.from(document.querySelectorAll('.gv-thumb'));
+const gvSection = document.querySelector('.gallery');
+let gvThumbs = [];
+let gi = 0;
+function showChart(i, scroll = true) {
+  if (!gvThumbs.length) return;
+  gi = (i + gvThumbs.length) % gvThumbs.length;
+  document.getElementById('gv-main').src = gvThumbs[gi].src;
+  document.getElementById('gv-cap').textContent = gvThumbs[gi].dataset.title;
+  document.getElementById('gv-count').textContent = (gi + 1) + ' / ' + gvThumbs.length;
+  gvThumbs.forEach((t, k) => t.classList.toggle('active', k === gi));
+  if (scroll) gvThumbs[gi].scrollIntoView({ block: 'nearest', inline: 'nearest' });
+}
+function showGallerySet(k) {
+  if (!gvSection) return;
+  gvThumbs = gvAll.filter(t => t.dataset.set === String(k));
+  gvAll.forEach(t => { t.hidden = !gvThumbs.includes(t); });
+  gvSection.hidden = !gvThumbs.length;
+  if (MODELS.length > 1 && MODELS[k].note) {
+    document.getElementById('gv-sub').textContent = 'Report charts for the selected model: ' + MODELS[k].note +
+      ' Use the arrows or thumbnails to click through them.';
   }
+  showChart(0, false);  // no scroll, or the page jumps to the gallery instead of the map
+}
+if (gvSection) {
   document.getElementById('gv-prev').addEventListener('click', () => showChart(gi - 1));
   document.getElementById('gv-next').addEventListener('click', () => showChart(gi + 1));
-  gvThumbs.forEach((t, k) => t.addEventListener('click', () => showChart(k)));
-  showChart(0, false);  // no scroll on load, or the page opens at the gallery instead of the map
+  gvAll.forEach(t => t.addEventListener('click', () => showChart(gvThumbs.indexOf(t))));
+  showGallerySet(mi);
 }
 </script>
 </body>

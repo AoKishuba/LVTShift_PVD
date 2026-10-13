@@ -1,4 +1,4 @@
-"""Tests for the parcel map (lvt.parcel_map): the land:building ratio slider and shared-lot merging."""
+"""Tests for the parcel map (lvt.parcel_map): the ratio slider, shared-lot merging and the model checkbox."""
 import json
 import re
 import sys
@@ -106,4 +106,47 @@ def test_accounts_sharing_a_lot_polygon_are_drawn_once(tmp_path):
     assert np.isclose(shared['cur'], units['current_tax'].sum())
     assert np.isclose(shared['new'], units['new_tax'].sum())
     assert np.isclose(shared['pct'], round((units['new_tax'].sum() / units['current_tax'].sum() - 1) * 100, 1))
-    assert all('bl' in a and 'g' in a for a in shared['u'])   # each unit is re-solved by the ratio slider
+    assert all('bl0' in a and 'g0' in a for a in shared['u'])   # each unit is re-solved by the ratio slider
+
+
+def _two_models():
+    primary = _as_export(_split(_parcels(), 4.0))
+    alternative = _as_export(_split(_parcels(), 2.0), model_type='split_rate:2.0')
+    for frame in (primary, alternative):
+        frame['parcel_id'] = ['A', 'B', 'C', 'D']
+    return primary, alternative.iloc[::-1].reset_index(drop=True)   # row order may differ between exports
+
+
+def _map_payload(path):
+    html = Path(path).read_text()
+    models = json.loads(re.search(r'const MODELS = (.*?);\n', html).group(1))
+    data = json.loads(re.search(r'const DATA = (.*?);\nconst CENTER', html, flags=re.S).group(1))
+    return models, [f['properties'] for f in data['features']]
+
+
+def test_alternative_model_is_lined_up_by_parcel_id(tmp_path):
+    primary, alternative = _two_models()
+    out = create_parcel_map(primary, 'testcity', output_dir=str(tmp_path), simplify_tolerance_m=None,
+                            alternative={'source': alternative, 'label': 'Use 2:1'})
+    models, accounts = _map_payload(out)
+    assert [m['spec']['ratio'] for m in models] == [4.0, 2.0] and models[1]['label'] == 'Use 2:1'
+    by_id = {a['pid']: a for a in accounts}
+    for model, frame in enumerate([primary, alternative]):
+        spec = models[model]['spec']
+        g = spec['groups'][0]
+        for _, row in frame.iterrows():
+            a = by_id[row['parcel_id']]
+            # the browser's closed form for this model reproduces that model's new_tax for the same account
+            new = g['T'] * (spec['ratio'] * a[f'bl{model}'] + a[f'bi{model}']) / (spec['ratio'] * g['L'] + g['B'])
+            assert np.isclose(new, row['new_tax'], atol=0.01)
+
+
+def test_alternative_must_describe_the_same_bills(tmp_path):
+    primary, alternative = _two_models()
+    alternative.loc[0, 'parcel_id'] = 'Z'
+    try:
+        create_parcel_map(primary, 'testcity', output_dir=str(tmp_path), alternative={'source': alternative, 'label': 'x'})
+    except ValueError as err:
+        assert 'different parcel_ids' in str(err)
+    else:
+        raise AssertionError('mismatched accounts should be rejected')
